@@ -119,6 +119,12 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   const bool cuda = provider == "cuda" || provider == "cuda-tf32" || provider == "cuda-hybrid" || provider == "cuda-all";
   if (!cuda && provider != "cpu")
     throw std::runtime_error("provider must be cpu, cuda, cuda-all, cuda-hybrid or cuda-tf32");
+  // fused attribute sampling (export.DecodeSample): on the GPU placements by default (records/s at B = 1 / 8 / 32:
+  // 86 / 295 / 340 -> 103 / 384 / 399); on the CPU it gains nothing and is slower at B = 32 (43 -> 34): the host
+  // loop it replaces is cheap there, and the graph's full-vocabulary sort is slower in ORT than the C++ sampler.
+  // LPP_FUSED=0 / 1 forces it off / on (A/B runs).
+  const char* fu = std::getenv("LPP_FUSED");
+  const bool fused = fu ? std::string(fu) != "0" : cuda && provider != "cuda-hybrid";
   auto make_options = [&](bool gpu, bool cuda_graph = false) {
     Ort::SessionOptions so;
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -143,9 +149,7 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   // static one-step graphs: CUDA Graph capture unless LPP_CUDA_GRAPH=0 (A/B runs)
   const char* cg = std::getenv("LPP_CUDA_GRAPH");
   Ort::SessionOptions so_step = make_options(cuda, !(cg && std::string(cg) == "0"));
-  // fused attribute sampling (export.DecodeSample): used when present; LPP_FUSED=0 skips it (A/B runs)
-  const char* fu = std::getenv("LPP_FUSED");
-  const bool fused = !(fu && std::string(fu) == "0");
+
   for (auto& [name, g] : m["graphs"].items()) {
     if (name == "decode_sample" && !fused) continue;
     const bool backbone = name == "chunk" || name == "chunk_cached";
