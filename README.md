@@ -252,7 +252,7 @@ bench/                   算子基准测试与优化报告
 - [x] 协议 v2：独立形状分档、版本化颜色码本
 - [x] GRPO 后训练与独立评委评估
 - [x] ONNX 导出、C++ 运行时、CUDA Graph、FP16/INT8/INT4 量化
-- [x] base 模型按 训练计划 v3 训练完成：贝塞尔线条 + 草稿顺序
+- [x] base 模型按训练计划 v3 训练完成：贝塞尔线条 + 草稿顺序
 - [x] 属性采样移进计算图（融合采样 + FP16，B=32 达 586 records/s）
 - [x] 本地服务 strata：OpenAI 兼容接口、流式、合批、续画、照图画
 - [ ] 权重发布到 Hugging Face（CC BY-NC 4.0）
