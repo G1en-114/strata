@@ -14,11 +14,13 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <random>
 #include <sstream>
 #include <string>
 
 #include "npy.h"
 #include "painter.h"
+#include "text_encoder.h"
 #include "raster.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -30,13 +32,35 @@ int main(int argc, char** argv) {
   std::map<std::string, std::string> a{{"--provider", "cpu"}, {"--cfg-scale", "2"}, {"--top-p", "0.9"},
                                        {"--max-records", "0"}, {"--require", "0,2"}, {"--temperature", "1"}};
   for (int i = 1; i + 1 < argc; i += 2) a[argv[i]] = argv[i + 1];
-  for (const char* k : {"--onnx", "--text", "--text-valid", "--uniforms", "--out"})
-    if (!a.count(k)) {
-      std::cerr << "missing " << k << "\n";
-      return 2;
-    }
+  // text: --prompts FILE (one prompt per line, tokenized and encoded here: text_encoder.onnx + tokenizer.json) or
+  // precomputed --text / --text-valid (.npy, as tools/ort_generate.py --dump writes). Randomness: --uniforms .npy,
+  // or --seed N (std::mt19937, float32 uniforms in [0, 1)).
+  const bool prompts = a.count("--prompts") > 0;
+  for (const char* k : {"--onnx", "--out"})
+    if (!a.count(k)) { std::cerr << "missing " << k << "\n"; return 2; }
+  if (!prompts && (!a.count("--text") || !a.count("--text-valid"))) { std::cerr << "need --prompts or --text + --text-valid\n"; return 2; }
+  if (!a.count("--uniforms") && !a.count("--seed")) { std::cerr << "need --uniforms or --seed\n"; return 2; }
   try {
-    NpyArray text = load_npy(a["--text"]), tv = load_npy(a["--text-valid"]), un = load_npy(a["--uniforms"]);
+    NpyArray text, tv, un;
+    if (prompts) {
+      std::ifstream pf(a["--prompts"]);
+      std::vector<std::string> lines;
+      for (std::string l; std::getline(pf, l);) if (!l.empty()) lines.push_back(l);
+      if (lines.empty()) throw std::runtime_error("no prompts in " + a["--prompts"]);
+      TextEncoder enc(a["--onnx"]);
+      const auto t0 = std::chrono::steady_clock::now();
+      TextBatch tb = enc.encode(lines);
+      std::printf("encoded %d prompts in %.3fs\n", tb.B, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      text = NpyArray::from_f32({tb.B, tb.Lt, tb.dim}, tb.feats);
+      tv = NpyArray::from_u8({tb.B, tb.Lt}, tb.valid);
+      if (a.count("--dump-text")) {
+        std::filesystem::create_directories(a["--dump-text"]);
+        save_npy(a["--dump-text"] + "/text.npy", "<f4", {tb.B, tb.Lt, tb.dim}, tb.feats.data(), tb.feats.size() * 4);
+        save_npy(a["--dump-text"] + "/text_valid.npy", "|b1", {tb.B, tb.Lt}, tb.valid.data(), tb.valid.size());
+      }
+    } else {
+      text = load_npy(a["--text"]), tv = load_npy(a["--text-valid"]);
+    }
     // cuda-auto: placement by batch size AND model size (measured on RTX 5070 Laptop). The per-record heads
     // (decode_heads, 9 calls per record) run faster on the CPU only while they are small: small model
     // (16 MB heads) at batch 1-2 -> cuda-hybrid 266 vs cuda 174 records/s; base model (59 MB heads) at batch 1
@@ -52,8 +76,20 @@ int main(int argc, char** argv) {
     const Protocol& P = painter.protocol();
     if (text.dtype != "<f4" || text.shape.size() != 3) throw std::runtime_error("text must be float32 [B, Lt, D]");
     const int B = static_cast<int>(text.shape[0]), Lt = static_cast<int>(text.shape[1]);
-    const int fields = static_cast<int>(un.shape[1]), steps = static_cast<int>(un.shape[0]);
-    if (un.shape[2] != B || fields != 1 + static_cast<int>(P.attrs.size())) throw std::runtime_error("uniforms shape mismatch");
+    const int fields = 1 + static_cast<int>(P.attrs.size());
+    std::vector<float> seeded;
+    int steps;
+    if (a.count("--uniforms")) {
+      un = load_npy(a["--uniforms"]);
+      steps = static_cast<int>(un.shape[0]);
+      if (un.shape[2] != B || un.shape[1] != fields) throw std::runtime_error("uniforms shape mismatch");
+    } else {
+      steps = P.max_positions;                                          // enough for any sequence
+      std::mt19937 rng(static_cast<uint32_t>(std::stoul(a["--seed"])));
+      std::uniform_real_distribution<float> U01(0.f, 1.f);
+      seeded.resize(size_t(steps) * fields * B);
+      for (auto& x : seeded) x = U01(rng);
+    }
     std::vector<float> tf(text.as<float>(), text.as<float>() + text.size());
     std::vector<uint8_t> tvb(tv.data.begin(), tv.data.end());
     GenerateConfig cfg;
@@ -64,7 +100,7 @@ int main(int argc, char** argv) {
     std::stringstream ss(a["--require"]);
     for (std::string t; std::getline(ss, t, ',');)
       if (!t.empty()) cfg.require_before_eos.insert(std::stoi(t));
-    const float* U = un.as<float>();
+    const float* U = seeded.empty() ? un.as<float>() : seeded.data();
     Uniforms uni = [&](int step, int field, int b) {
       if (step >= steps) throw std::runtime_error("uniform table too short");
       return U[(size_t(step) * fields + field) * B + b];

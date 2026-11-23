@@ -18,7 +18,8 @@ endif()
 find_file(ORT_LIB NAMES libonnxruntime.so libonnxruntime.so.1.32.0 PATHS ${ORT_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
 message(STATUS "onnxruntime: ${ORT_LIB}")
 
-add_executable(lpp_paint src/main.cpp src/protocol.cpp src/grammar.cpp src/raster.cpp src/session.cpp src/painter.cpp)
+add_executable(lpp_paint src/main.cpp src/protocol.cpp src/grammar.cpp src/raster.cpp src/session.cpp src/painter.cpp
+                         src/tokenizer.cpp src/text_encoder.cpp)
 target_include_directories(lpp_paint PRIVATE ${ORT_INCLUDE_DIR} src)
 target_link_libraries(lpp_paint PRIVATE ${ORT_LIB})
 # the wheel ships libonnxruntime.so.1.32.0 but the library's SONAME is libonnxruntime.so.1:

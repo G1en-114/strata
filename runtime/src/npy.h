@@ -19,6 +19,16 @@ struct NpyArray {
     return n;
   }
   template <class T> const T* as() const { return reinterpret_cast<const T*>(data.data()); }
+  static NpyArray from_f32(std::vector<int64_t> shape, const std::vector<float>& v) {
+    NpyArray a{"<f4", std::move(shape), {}};
+    a.data.assign(reinterpret_cast<const char*>(v.data()), reinterpret_cast<const char*>(v.data()) + v.size() * 4);
+    return a;
+  }
+  static NpyArray from_u8(std::vector<int64_t> shape, const std::vector<uint8_t>& v) {
+    NpyArray a{"|b1", std::move(shape), {}};
+    a.data.assign(v.begin(), v.end());
+    return a;
+  }
 };
 
 inline NpyArray load_npy(const std::string& path) {
