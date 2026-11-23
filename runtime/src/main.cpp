@@ -106,6 +106,20 @@ int main(int argc, char** argv) {
       return U[(size_t(step) * fields + field) * B + b];
     };
 
+    if (a.count("--forced")) {               // records.npy layout [B, T, 3 + A] (-2 padding); row 0 is BOS
+      NpyArray fr = load_npy(a["--forced"]);
+      if (fr.dtype != "<i8" || fr.shape.size() != 3 || fr.shape[0] != B || fr.shape[2] != 3 + static_cast<int64_t>(P.attrs.size()))
+        throw std::runtime_error("--forced must be int64 [B, T, 3 + A]");
+      const int64_t T = fr.shape[1], W = fr.shape[2];
+      const int64_t* F = fr.as<int64_t>();
+      cfg.forced.assign(B, {});
+      for (int b = 0; b < B; ++b)
+        for (int64_t t = 1; t < T; ++t) {
+          const int64_t* row = F + (size_t(b) * T + t) * W;
+          if (row[0] == -2) break;
+          cfg.forced[b].push_back({row[0], row[1], row[2], std::vector<int64_t>(row + 3, row + W)});
+        }
+    }
     auto t0 = std::chrono::steady_clock::now();
     auto seqs = painter.generate(B, cfg, tf, tvb, Lt, uni);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

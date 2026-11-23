@@ -331,7 +331,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
   // ---- decode loop
   std::vector<Grammar> gram;
   for (int b = 0; b < B; ++b) {
-    gram.emplace_back(P, cfg.require_before_eos, false, P.draft);
+    gram.emplace_back(P, cfg.require_before_eos, !cfg.forced.empty(), P.draft);   // prefixes may hold REFINE / REDRAW
   }
   std::vector<std::vector<Record>> out(B);
   for (int b = 0; b < B; ++b) out[b].push_back({P.kind_bos, -1, -1, std::vector<int64_t>(A, P.no_attr)});
@@ -405,6 +405,9 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
       for (int e : allowed) m[e] = l[e];
       ev[b] = sample_top_p(m.data(), E, cfg.sample, uni(step, 0, b));
     }
+    auto in_prefix = [&](int b) { return !cfg.forced.empty() && step - 1 < static_cast<int>(cfg.forced[b].size()); };
+    for (int b = 0; b < B; ++b)
+      if (in_prefix(b)) ev[b] = cfg.forced[b][step - 1].event;
     std::vector<std::vector<int64_t>> attrs(B, std::vector<int64_t>(A, P.no_attr));
     if (std::any_of(ev.begin(), ev.end(), [&](int64_t e) { return P.is_stroke(e); })) {
       if (guided && g_.has("decode_sample")) {
@@ -437,6 +440,8 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
         else if (ev[b] == prim_ev && P.bend_attr >= 0) attrs[b][P.bend_attr] = P.bend_mid;  // Gaussians: bend = 0
       }
     }
+    for (int b = 0; b < B; ++b)
+      if (in_prefix(b)) attrs[b] = cfg.forced[b][step - 1].attrs;
     std::vector<int64_t> layer(B), kind(B);
     std::vector<uint8_t> live(B);
     for (int b = 0; b < B; ++b) {

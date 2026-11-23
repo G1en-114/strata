@@ -25,6 +25,10 @@ struct GenerateConfig {
   // records so far and which samples have finished
   std::function<void(int step, const std::vector<std::vector<Record>>& out, const std::vector<bool>& done)> on_progress;
   int progress_every = 25;
+  // continuation (lpp.sample.generate's `forced`): per sample, records after BOS taken instead of sampled, through
+  // the same grammar, KV cache and canvas; decoding continues where a prefix ends. A prefix may end in a REFINE_k /
+  // REDRAW_k marker (refine or repaint layer k of a finished painting). Empty: no prefixes.
+  std::vector<std::vector<Record>> forced;
 };
 
 // uniform(step, field, b): field 0 = event, 1 + i = attribute i
