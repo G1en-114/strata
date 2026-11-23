@@ -22,20 +22,19 @@
 <a href="#关键结果">关键结果</a> •
 <a href="#本地服务strata">本地服务</a> •
 <a href="#快速开始">快速开始</a> •
-<a href="#路线图">路线图</a> •
-<a href="docs/architecture.md">架构文档</a>
+<a href="#路线图">路线图</a>
 </p>
 
 </div>
 
 <p align="center">
-<img src="docs/img_v3_samples.jpg" alt="v3 模型根据中文描述生成的动漫与真人头像" width="100%">
+<img src="assets/img_v3_samples.jpg" alt="v3 模型根据中文描述生成的动漫与真人头像" width="100%">
 <br>
 <sub>v3 模型（129M）只看中文描述、一笔一笔画出的结果：上排动漫，下排真人照片风格（验证集描述，CFG 5，top-p 0.6，每条一张，未挑选）</sub>
 </p>
 
 <p align="center">
-<img src="docs/img_trace_frog_decompose.jpg" alt="分解器逐笔临摹一张训练范围之外的图片" width="100%">
+<img src="assets/img_trace_frog_decompose.jpg" alt="分解器逐笔临摹一张训练范围之外的图片" width="100%">
 <br>
 <sub>分解器把一张训练范围外的 3D 卡通图拆成 2 个图层、864 笔广义高斯笔触（29.3 dB，8.1 s）：最左是原图，往右依次是笔触逐步叠加的过程</sub>
 </p>
@@ -84,8 +83,6 @@ flowchart LR
 - **画面表示**：广义高斯图元，premultiplied over 合成满足结合律，所以整张渲染、按层渲染、分块渲染结果完全一致，分层编辑才成立。
 - **协议**：每个属性单独量化（x、y 各 512 档，颜色用 4096 色 Oklab 码本），语法 mask 保证序列合法；协议和码本带 SHA，防止跨机器、跨版本混用。
 - **上下文**：1024 个记录（每张画约 700 笔），先画所有图层的草稿，再逐层细化。
-
-完整的设计说明、逐模块参数表和创新点见 **[docs/architecture.md](docs/architecture.md)**（另有 [PDF 版](docs/architecture.pdf)）。
 
 ## 关键结果
 
@@ -171,8 +168,6 @@ GPU 要到 B=32 矩阵乘够大，Tensor Core 才起作用。
 </td></tr>
 </table>
 
-完整数据和踩过的坑见 [deploy_report_v3.md](docs/deploy_report_v3.md) · [quant_report.md](docs/quant_report.md) · [perf_log.md](docs/perf_log.md)。
-
 ## 本地服务：strata
 
 类似 Ollama 的本地服务，浏览器打开就能看着模型一笔一笔作画。
@@ -217,13 +212,11 @@ runtime/run.sh --help
 ```
 
 <details>
-<summary><b>更多：海光 DCU、训练启动、续接</b></summary>
+<summary><b>更多：海光 DCU、训练启动</b></summary>
 
 - 部分 DTK 构建会尝试加载未提供的 FlashAttention 库；训练可加 `--sdpa-backend math` 改用 PyTorch 内置注意力。
 - 一条完整轨迹的清理、覆盖检查、远程 SHA 校验和训练启动，可用
-  `python tools/start_ready_training.py --plan <launch-plan.json>` 串起来，
-  见[续接记录](docs/continuation_2026-11-15.md)。
-- 接手请先读 [Claude 最新交接](docs/CLAUDE_HANDOFF.md)。
+  `python tools/start_ready_training.py --plan <launch-plan.json>` 串起来。
 
 </details>
 
@@ -246,42 +239,30 @@ runtime/                 C++ 推理运行时（语法、采样、光栅化、ORT
 tools/                   数据处理、训练、GRPO、ONNX 导出、量化、评估、照图画
 ops/plan_v3/             多机流水线与 autopilot
 bench/                   算子基准测试与优化报告
-docs/                    设计文档与实验记录
 ```
 
 ## 路线图
 
 - [x] 序列协议、Oklab 颜色码本、log 协方差形状参数化
 - [x] 可微参考光栅化器 + Triton tile 算子（前向/反向，[分解器快 64×](bench/REPORT_raster.md)）
-- [x] 原生 CUDA/HIP 算子，同一份源码跑在 NVIDIA 和海光 DCU 上（[移植记录](docs/hip_port_log.md)）
+- [x] 原生 CUDA/HIP 算子，同一份源码跑在 NVIDIA 和海光 DCU 上
 - [x] 分层分解器：量化感知拟合、amodal 补全、图层越界约束
 - [x] CelebAMask-HQ 3 万张 × 12 条轨迹；动漫 5 万张 × 4 条轨迹，约 56 万条序列
 - [x] 两级模型（tiny / small / base）、Chinese-CLIP 文字条件 + CFG、画布反馈
-- [x] [协议 v2](docs/protocol_v2.md)：独立形状分档、版本化颜色码本
-- [x] GRPO 后训练与独立评委评估（[记录](docs/rl_log.md)）
-- [x] ONNX 导出、C++ 运行时、CUDA Graph、FP16/INT8/INT4 量化（[运行时](docs/runtime_design.md) · [量化报告](docs/quant_report.md)）
-- [x] base 模型按 [训练计划 v3](docs/plan_v3_training.md) 训练完成：贝塞尔线条 + 草稿顺序
+- [x] 协议 v2：独立形状分档、版本化颜色码本
+- [x] GRPO 后训练与独立评委评估
+- [x] ONNX 导出、C++ 运行时、CUDA Graph、FP16/INT8/INT4 量化
+- [x] base 模型按 训练计划 v3 训练完成：贝塞尔线条 + 草稿顺序
 - [x] 属性采样移进计算图（融合采样 + FP16，B=32 达 586 records/s）
 - [x] 本地服务 strata：OpenAI 兼容接口、流式、合批、续画、照图画
 - [ ] 权重发布到 Hugging Face（CC BY-NC 4.0）
 - [ ] TensorRT 后端；连续合批（continuous batching）与压测
 - [ ] 多卡 DDP 扩展效率实测
 
-## 文档
-
-| 主题 | 文档 |
-|---|---|
-| 系统架构与创新点 | [architecture.md](docs/architecture.md) |
-| 协议设计 | [protocol_v2.md](docs/protocol_v2.md) · [protocol_v3_design.md](docs/protocol_v3_design.md) |
-| 画布反馈 | [canvas_feedback_design.md](docs/canvas_feedback_design.md) |
-| 训练与强化学习 | [training_pipeline.md](docs/training_pipeline.md) · [rl_log.md](docs/rl_log.md) · [plan_v3_training.md](docs/plan_v3_training.md) · [plan_v4.md](docs/plan_v4.md) |
-| 部署与性能 | [deploy_report_v3.md](docs/deploy_report_v3.md) · [runtime_design.md](docs/runtime_design.md) · [quant_report.md](docs/quant_report.md) · [perf_log.md](docs/perf_log.md) |
-| 数据 | [anime_data_log.md](docs/anime_data_log.md) · [data_lessons.md](docs/data_lessons.md) · [image_cond_log.md](docs/image_cond_log.md) |
-
 ## 已知的局限
 
 - 只会画真人头像和动漫头像两类；其他题材超出训练分布。
-- “输入一张图让模型直接画”（残差画布）试了三轮，人脸最高 13.06 dB，没过事先定的 18 dB 线，已按计划停止（[plan_v4.md](docs/plan_v4.md)）；当前做法是分解器先拟合草稿，模型接着画完。
+- “输入一张图让模型直接画”（残差画布）试了三轮，人脸最高 13.06 dB，没过事先定的 18 dB 线，已按计划停止；当前做法是分解器先拟合草稿，模型接着画完。
 - 仅权重量化在 GPU 上没有收益，这是 129M 规模下的结论，不能外推到 1B 以上。
 
 ## 许可与致谢
