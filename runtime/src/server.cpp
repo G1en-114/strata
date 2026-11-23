@@ -132,7 +132,9 @@ struct Job {
   std::vector<std::string> ids;                    // their painting ids (set before the result)
   std::string edit_from, edit_mode;                // continue a painting: "refine" | "redraw" layer edit_layer
   int edit_layer = -1;
-  std::vector<Record> forced;                      // built on the worker from edit_from
+  std::vector<Record> forced;                      // continuation prefix: built on the worker from edit_from, or
+                                                   // given (a traced sketch, /api/trace mode=sketch)
+  bool continuation = false;                       // decoded with a prefix (relaxed grammar, own batches)
   double queued = now_s();
 };
 
@@ -162,6 +164,13 @@ class Server {
     { std::lock_guard<std::mutex> lk(mu_); queue_.push_back(std::move(j)); }
     cv_.notify_one();
     return f;
+  }
+  // the protocol of a model (for rendering outside the worker): loaded once
+  const Protocol& protocol(const std::string& model) {
+    std::lock_guard<std::mutex> lk(protomu_);
+    auto it = protos_.find(model);
+    if (it == protos_.end()) it = protos_.emplace(model, std::make_unique<Protocol>(Protocol::load(dirs_.at(model)))).first;
+    return *it->second;
   }
   bool recall(const std::string& id, Painting& out) {
     std::lock_guard<std::mutex> lk(pmu_);
@@ -197,7 +206,7 @@ class Server {
       auto& j = *it;
       // continuations relax the grammar (REFINE / REDRAW allowed): never batched with fresh paintings
       if (j->model == first->model && j->cfg_scale == first->cfg_scale && j->top_p == first->top_p &&
-          j->edit_from.empty() == first->edit_from.empty() &&
+          j->continuation == first->continuation &&
           images + j->n <= std::max(max_batch_, first->n)) {
         images += j->n;
         batch.push_back(j);
@@ -259,7 +268,7 @@ class Server {
     GenerateConfig cfg;
     cfg.sample.cfg_scale = batch[0]->cfg_scale;
     cfg.sample.top_p = batch[0]->top_p;
-    if (!batch[0]->edit_from.empty()) {
+    if (batch[0]->continuation) {
       cfg.require_before_eos.clear();
       for (int b = 0; b < B; ++b) cfg.forced.push_back(owner[b].first->forced);
     }
@@ -304,6 +313,8 @@ class Server {
               << " s (" << static_cast<int>(recs / secs) << " records/s)\n";
   }
 
+
+ public:
   std::string remember(Painting p) {
     std::lock_guard<std::mutex> lk(pmu_);
     const std::string id = "p" + std::to_string(++next_painting_);
@@ -312,7 +323,10 @@ class Server {
     while (porder_.size() > 512) paintings_.erase(porder_.front()), porder_.pop_front();
     return id;
   }
-  std::mutex pmu_;
+
+ private:
+  std::mutex pmu_, protomu_;
+  std::map<std::string, std::unique_ptr<Protocol>> protos_;
   long next_painting_ = 0;
   std::map<std::string, Painting> paintings_;
   std::deque<std::string> porder_;
@@ -367,6 +381,63 @@ void error(httplib::Response& res, int status, const std::string& msg, const std
   res.set_content(json{{"error", {{"message", msg}, {"type", type}}}}.dump(), "application/json");
 }
 
+// ---- picture -> strokes, by the local trace service (tools/trace_service.py, PyTorch decomposer)
+json call_trace(int port, const std::string& image, bool sketch) {
+  httplib::Client cli("127.0.0.1", port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(600);
+  auto r = cli.Post(std::string("/trace?sketch=") + (sketch ? "1" : "0"), image, "application/octet-stream");
+  if (!r) throw std::runtime_error("the trace service is not running on port " + std::to_string(port) +
+                                   " (./serve.sh starts it: tools/trace_service.py)");
+  json j = json::parse(r->body);
+  if (r->status != 200) throw std::runtime_error(j.value("error", "trace service error"));
+  return j;
+}
+
+std::vector<Record> records_from(const json& rows) {
+  std::vector<Record> out;
+  for (auto& r : rows) {
+    std::vector<int64_t> v = r.get<std::vector<int64_t>>();
+    out.push_back({v[0], v[1], v[2], std::vector<int64_t>(v.begin() + 3, v.end())});
+  }
+  return out;
+}
+
+// a streamed NDJSON response: producer(push) runs on its own thread; push(line, last)
+using Push = std::function<void(std::string, bool)>;
+void stream_lines(httplib::Response& res, std::function<void(Push)> producer) {
+  struct Chan {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool finished = false;
+  };
+  auto ch = std::make_shared<Chan>();
+  Push push = [ch](std::string line, bool last) {
+    { std::lock_guard<std::mutex> lk(ch->mu); ch->lines.push_back(std::move(line)); ch->finished = ch->finished || last; }
+    ch->cv.notify_all();
+  };
+  std::thread([producer, push] {
+    try { producer(push); }
+    catch (const std::exception& e) { push(json{{"error", e.what()}, {"done", true}}.dump() + "\n", true); }
+  }).detach();
+  res.set_chunked_content_provider("application/x-ndjson", [ch](size_t, httplib::DataSink& sink) {
+    std::unique_lock<std::mutex> lk(ch->mu);
+    ch->cv.wait(lk, [&] { return !ch->lines.empty() || ch->finished; });
+    while (!ch->lines.empty()) {
+      std::string l = std::move(ch->lines.front());
+      ch->lines.pop_front();
+      if (!sink.write(l.data(), l.size())) return false;
+    }
+    if (ch->finished) sink.done();
+    return true;
+  });
+}
+
+std::string form(const httplib::Request& req, const std::string& key, const std::string& dflt = "") {
+  return req.has_file(key) ? req.get_file_value(key).content : dflt;
+}
+
 std::shared_ptr<Job> job_from(const json& body, Server& srv, std::string& err) {
   auto j = std::make_shared<Job>();
   j->model = body.value("model", srv.models().begin()->first);
@@ -374,6 +445,7 @@ std::shared_ptr<Job> job_from(const json& body, Server& srv, std::string& err) {
   if (body.contains("from")) {                      // continue a finished painting
     Painting src;
     j->edit_from = body["from"].get<std::string>();
+    j->continuation = true;
     if (!srv.recall(j->edit_from, src)) { err = "unknown painting id '" + j->edit_from + "' (ids live until the server restarts)"; return nullptr; }
     j->model = src.model;                           // the prefix belongs to the model that painted it
     if (j->prompt.empty()) j->prompt = src.prompt;  // a new prompt edits the layer (e.g. other hair colour)
@@ -518,6 +590,101 @@ int serve(const std::map<std::string, std::string>& a, const std::map<std::strin
       return true;
     });
   });
+  // ---- painting from a picture: mode "trace" replays the decomposer's strokes (high fidelity, any picture);
+  // mode "sketch" gives the model the traced sketch and lets it paint the rest (prompt-guided). The result gets a
+  // painting id like any other, so it can be refined / redrawn afterwards.
+  const int trace_port = std::stoi(a.at("--trace-port"));
+  auto picture_job = [&srv, trace_port](const std::string& image, const std::string& mode, json opts, Push push,
+                                        double t0, int every) -> std::vector<std::string> {
+    const std::string model = opts.value("model", srv.models().begin()->first);
+    if (!srv.has(model)) throw std::runtime_error("unknown model '" + model + "'");
+    if (push) push(json{{"status", "tracing"}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+    json tr = call_trace(trace_port, image, mode == "sketch");
+    auto recs = records_from(tr["records"]);
+    if (push) push(json{{"status", "traced"}, {"psnr", tr["psnr"]}, {"strokes", tr["strokes"]}, {"lines", tr["lines"]},
+                        {"seconds", tr["seconds"]}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+    const std::string prompt = opts.value("prompt", "");
+    if (mode == "trace") {
+      const Protocol& P = srv.protocol(model);
+      std::vector<Record> cur;
+      int strokes = 0;
+      for (size_t t = 0; t < recs.size(); ++t) {             // replay the strokes as the painting animation
+        cur.push_back(recs[t]);
+        strokes += recs[t].kind == P.kind_primitive;
+        if (push && recs[t].kind == P.kind_primitive && strokes % std::max(1, every) == 0)
+          push(json{{"model", model}, {"index", 0}, {"step", static_cast<int>(t)}, {"strokes", strokes}, {"done", false},
+                    {"image_done", false}, {"image", base64(render_png(P, cur))}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+      }
+      std::string img = render_png(P, recs);
+      const std::string id = srv.remember({model, prompt, recs});
+      if (push) push(json{{"model", model}, {"index", 0}, {"step", static_cast<int>(recs.size())}, {"strokes", strokes},
+                          {"done", false}, {"image_done", true}, {"image", base64(img)}, {"id", id}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+      return {img};
+    }
+    if (prompt.empty()) throw std::runtime_error("mode sketch needs a prompt (what the model should paint over the sketch)");
+    json body = opts;
+    body["model"] = model;
+    std::string err;
+    auto j = job_from(body, srv, err);
+    if (!j) throw std::runtime_error(err);
+    j->n = 1;
+    j->continuation = true;
+    j->forced.assign(recs.begin() + 1, recs.end());          // after BOS: the sketch, then the model goes on
+    if (push) {
+      j->progress_every = every;
+      j->on_frame = [push, model, t0](const Frame& f) {
+        json line{{"model", model}, {"index", f.index}, {"step", f.step}, {"strokes", f.strokes}, {"done", false},
+                  {"image_done", f.done}, {"image", base64(f.png)}, {"elapsed", now_s() - t0}};
+        if (!f.id.empty()) line["id"] = f.id;
+        push(line.dump() + "\n", false);
+      };
+    }
+    return srv.submit(j).get();
+  };
+  auto read_upload = [](const httplib::Request& req, std::string& image, json& opts, std::string& err) {
+    if (!req.is_multipart_form_data() || !req.has_file("image")) { err = "send multipart/form-data with an 'image' file"; return false; }
+    image = req.get_file_value("image").content;
+    opts = json::object();
+    for (const char* k : {"model", "prompt"}) if (req.has_file(k)) opts[k] = form(req, k);
+    for (const char* k : {"cfg_scale", "top_p"}) if (req.has_file(k)) opts[k] = std::stof(form(req, k));
+    if (req.has_file("seed")) opts["seed"] = static_cast<uint32_t>(std::stoul(form(req, "seed")));
+    return true;
+  };
+  http.Post("/api/trace", [&](const httplib::Request& req, httplib::Response& res) {
+    cors(res);
+    std::string image, err;
+    json opts;
+    if (!read_upload(req, image, opts, err)) return error(res, 400, err);
+    const std::string mode = form(req, "mode", "trace");
+    if (mode != "trace" && mode != "sketch") return error(res, 400, "mode must be trace or sketch");
+    const int every = std::stoi(form(req, "progress_every", "20"));
+    const double t0 = now_s();
+    stream_lines(res, [=](Push push) {
+      picture_job(image, mode, opts, push, t0, every);
+      push(json{{"done", true}, {"total_duration", static_cast<long>((now_s() - t0) * 1e9)}}.dump() + "\n", true);
+    });
+  });
+  // OpenAI image edits: image + prompt -> picture; mode (non-standard field): trace (default) | sketch
+  http.Post("/v1/images/edits", [&](const httplib::Request& req, httplib::Response& res) {
+    cors(res);
+    std::string image, err;
+    json opts;
+    if (!read_upload(req, image, opts, err)) return error(res, 400, err);
+    const std::string mode = form(req, "mode", "trace");
+    if (mode != "trace" && mode != "sketch") return error(res, 400, "mode must be trace or sketch");
+    const std::string fmt = form(req, "response_format", "b64_json");
+    try {
+      auto pngs = picture_job(image, mode, opts, nullptr, now_s(), 20);
+      json data = json::array();
+      for (auto& pimg : pngs) {
+        if (fmt == "url") data.push_back({{"url", "http://" + req.get_header_value("Host") + "/images/" + store.put(pimg) + ".png"}});
+        else data.push_back({{"b64_json", base64(pimg)}});
+      }
+      res.set_content(json{{"created", static_cast<long>(now_s())}, {"data", data}}.dump(), "application/json");
+    } catch (const std::exception& e) {
+      error(res, 500, e.what(), "server_error");
+    }
+  });
   const int port = std::stoi(a.at("--port"));
   std::cerr << "strata " << kVersion << " listening on http://" << a.at("--host") << ":" << port << "  (models:";
   for (auto& [name, dir] : srv.models()) std::cerr << " " << name;
@@ -550,7 +717,8 @@ int main(int argc, char** argv) {
   }
   const std::string cmd = argv[1];
   std::map<std::string, std::string> a{{"--port", "11435"}, {"--host", "127.0.0.1"}, {"--provider", "cuda"},
-                                       {"--max-batch", "32"}, {"--web", "runtime/web"}, {"-o", "out.png"}};
+                                       {"--max-batch", "32"}, {"--web", "runtime/web"}, {"-o", "out.png"},
+                                       {"--trace-port", "11436"}};
   std::map<std::string, std::string> models;
   std::string prompt;
   for (int i = 2; i < argc; ++i) {

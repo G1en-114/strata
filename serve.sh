@@ -18,7 +18,7 @@ CKPT=${STRATA_CKPT:-runs/v3_formal/B_ft/model_step012000.pt}
 PY="${LPP_VENV:-$HOME/AI infra/.venv}/bin/python"
 TE=data/models/chinese-clip-vit-base-patch16
 M=out/onnx/v3_final_fused; M16=${M}_fp16
-UNIT=strata-serve
+UNIT=strata-serve; TUNIT=strata-trace; TPORT=${STRATA_TRACE_PORT:-11436}
 URL="http://localhost:$PORT"
 
 say() { printf '\033[1m[strata]\033[0m %s\n' "$*"; }
@@ -26,7 +26,7 @@ die() { printf '\033[31m[strata] %s\033[0m\n' "$*" >&2; exit 1; }
 
 case "${1:-up}" in
   stop)
-    systemctl --user stop $UNIT 2>/dev/null && say "stopped" || say "was not running"
+    systemctl --user stop $UNIT $TUNIT 2>/dev/null && say "stopped" || say "was not running"
     exit 0 ;;
   logs)
     exec journalctl --user -u $UNIT -f -o cat ;;
@@ -35,6 +35,7 @@ case "${1:-up}" in
       say "running at $URL"
       curl -s "$URL/v1/models" | "$PY" -c "import json,sys; print('  models:', ', '.join(m['id'] for m in json.load(sys.stdin)['data']))" || true
       curl -s "$URL/api/version" | "$PY" -c "import json,sys; s=json.load(sys.stdin)['stats']; print(f\"  {s['images']} images in {s['batches']} batches\")" || true
+      systemctl --user is-active -q $TUNIT && echo "  picture tracing: on (port $TPORT)" || echo "  picture tracing: off"
     else
       say "not running (./serve.sh to start)"
     fi
@@ -71,7 +72,14 @@ if [ "$PROVIDER" != cpu ]; then
   MODELS+=(--model "strata-v3:fp16=$M16")
 fi
 
-# 3. (re)start the server as a user service
+# 3. the picture-tracing helper (PyTorch decomposer, GPU), warm in its own process
+if [ "$PROVIDER" != cpu ]; then
+  systemctl --user stop $TUNIT 2>/dev/null || true
+  systemctl --user reset-failed $TUNIT 2>/dev/null || true
+  systemd-run --user --unit $TUNIT --same-dir --quiet "$PY" -u tools/trace_service.py --port "$TPORT"
+fi
+
+# 4. (re)start the server as a user service
 if systemctl --user is-active -q $UNIT; then
   say "restarting ..."
   systemctl --user stop $UNIT
@@ -81,7 +89,7 @@ if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   die "port $PORT is taken by another program (STRATA_PORT=... ./serve.sh to use another)"
 fi
 systemd-run --user --unit $UNIT --same-dir --quiet \
-  runtime/strata.sh serve "${MODELS[@]}" --port "$PORT" --host "$HOST" --provider "$PROVIDER" --web runtime/web
+  runtime/strata.sh serve "${MODELS[@]}" --port "$PORT" --host "$HOST" --provider "$PROVIDER" --web runtime/web --trace-port "$TPORT"
 for i in $(seq 1 60); do
   curl -sf "$URL/v1/models" > /dev/null 2>&1 && break
   systemctl --user is-active -q $UNIT || die "the server exited: ./serve.sh logs"
