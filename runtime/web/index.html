@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata Painter</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --chip: #eef1fb; --code: #f1f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151517; --panel: #1f1f23; --ink: #ececef; --muted: #9a9aa2; --line: #2e2e34;
+            --accent: #7b93ff; --accent-ink: #0f1020; --chip: #262a3d; --code: #18181b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: .02em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .stat { margin-left: auto; color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 20px; padding: 20px 24px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  textarea, select, input[type=number] { width: 100%; font: inherit; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  textarea { min-height: 96px; resize: vertical; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .range { display: flex; align-items: center; gap: 8px; }
+  .range input { flex: 1; }
+  .range span { width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { background: var(--chip); color: var(--ink); border: 0; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  button.go { width: 100%; margin-top: 16px; padding: 10px; border: 0; border-radius: 8px; background: var(--accent);
+              color: var(--accent-ink); font: inherit; font-weight: 600; cursor: pointer; }
+  button.go:disabled { opacity: .6; cursor: default; }
+  .stage { display: grid; grid-template-columns: repeat(auto-fill, minmax(256px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .card img { display: block; width: 100%; aspect-ratio: 1; image-rendering: auto; background: var(--code); }
+  .card .meta { display: flex; justify-content: space-between; gap: 8px; padding: 8px 10px; font-size: 12px; color: var(--muted);
+                font-variant-numeric: tabular-nums; }
+  .card a { color: var(--accent); text-decoration: none; }
+  .bar { height: 3px; background: var(--line); }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  h2 { font-size: 14px; margin: 20px 0 10px; color: var(--muted); font-weight: 600; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px;
+        overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .err { color: #d9480f; font-size: 13px; margin-top: 8px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Strata Painter</h1>
+  <span class="sub">高斯笔画 + 贝塞尔线条 · 自回归逐笔作画</span>
+  <span class="stat" id="stat"></span>
+</header>
+<main>
+  <section class="panel">
+    <label for="prompt">描述（中文）</label>
+    <textarea id="prompt">动漫，金发碧眼的少女，微笑，浅色背景</textarea>
+    <div class="chips" id="examples"></div>
+    <label for="model">模型</label>
+    <select id="model"></select>
+    <div class="row">
+      <div><label for="n">张数</label><input id="n" type="number" min="1" max="8" value="2"></div>
+      <div><label for="seed">种子（空 = 随机）</label><input id="seed" type="number" min="0" placeholder="随机"></div>
+    </div>
+    <label for="cfg">引导强度 CFG</label>
+    <div class="range"><input id="cfg" type="range" min="1" max="9" step="0.5" value="5"><span id="cfgv">5</span></div>
+    <label for="topp">top-p</label>
+    <div class="range"><input id="topp" type="range" min="0.3" max="1" step="0.05" value="0.6"><span id="toppv">0.6</span></div>
+    <button class="go" id="go">开始作画</button>
+    <div class="err" id="err"></div>
+    <h2>同样的请求，OpenAI 接口写法</h2>
+    <pre id="curl"></pre>
+  </section>
+  <section>
+    <div class="stage" id="stage"><div class="empty">输入描述，点「开始作画」，看模型一笔一笔画出来。</div></div>
+    <h2>历史</h2>
+    <div class="stage" id="history"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const EXAMPLES = [
+  "动漫，金发碧眼的少女，微笑，浅色背景",
+  "动漫，黑色长直发的少女，红色眼睛，白色上衣",
+  "动漫，粉色短发，蓝色眼睛，戴蝴蝶结",
+  "真人照片，黑色短发的男性，戴眼镜，深色背景",
+  "真人照片，金色波浪卷发的女性，微笑，红色口红",
+  "真人照片，灰白头发的男性，留着胡子，表情严肃",
+];
+for (const e of EXAMPLES) {
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = e.replace(/^(动漫|真人照片)，/, "$1 · ");
+  b.onclick = () => { $("prompt").value = e; updateCurl(); };
+  $("examples").appendChild(b);
+}
+for (const [r, v] of [["cfg", "cfgv"], ["topp", "toppv"]]) $(r).oninput = () => { $(v).textContent = $(r).value; updateCurl(); };
+for (const id of ["prompt", "model", "n", "seed"]) $(id).oninput = updateCurl;
+
+function body() {
+  const b = { model: $("model").value, prompt: $("prompt").value.trim(), n: Math.max(1, Math.min(8, +$("n").value || 1)),
+              cfg_scale: +$("cfg").value, top_p: +$("topp").value };
+  if ($("seed").value !== "") b.seed = +$("seed").value;
+  return b;
+}
+function updateCurl() {
+  const b = body();
+  const req = { model: b.model, prompt: b.prompt, n: b.n, size: "256x256", response_format: "b64_json",
+                cfg_scale: b.cfg_scale, top_p: b.top_p, ...(b.seed !== undefined ? { seed: b.seed } : {}) };
+  $("curl").textContent = `curl ${location.origin}/v1/images/generations \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(req)}'`;
+}
+
+async function loadModels() {
+  try {
+    const r = await (await fetch("/v1/models")).json();
+    $("model").innerHTML = r.data.map((m) => `<option>${m.id}</option>`).join("");
+  } catch (e) { $("err").textContent = "连不上服务：" + e; }
+  updateCurl();
+  refreshStat();
+}
+async function refreshStat() {
+  try {
+    const s = (await (await fetch("/api/version")).json()).stats;
+    $("stat").textContent = `已生成 ${s.images} 张 · ${s.batches} 批 · 平均 ${s.busy_seconds > 0 ? Math.round(s.records / s.busy_seconds) : 0} records/s`;
+  } catch (_) {}
+}
+
+function card(i) {
+  const c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML = `<img alt=""><div class="bar"><i></i></div><div class="meta"><span class="l">等待中…</span><span class="r"></span></div>`;
+  return c;
+}
+
+$("go").onclick = async () => {
+  const b = body();
+  if (!b.prompt) { $("err").textContent = "请先写描述"; return; }
+  $("err").textContent = ""; $("go").disabled = true; $("go").textContent = "作画中…";
+  const stage = $("stage"); stage.innerHTML = "";
+  const cards = Array.from({ length: b.n }, (_, i) => stage.appendChild(card(i)));
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/api/generate", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: b.model, prompt: b.prompt, n: b.n, stream: true, progress_every: 10,
+                             options: { cfg_scale: b.cfg_scale, top_p: b.top_p, ...(b.seed !== undefined ? { seed: b.seed } : {}) } }) });
+    if (!res.ok) throw new Error((await res.json()).error?.message || res.statusText);
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, k); buf = buf.slice(k + 1);
+        if (!line.trim()) continue;
+        const f = JSON.parse(line);
+        if (f.error) throw new Error(f.error);
+        if (f.done) continue;
+        const c = cards[f.index];
+        c.querySelector("img").src = "data:image/png;base64," + f.image;
+        c.querySelector(".bar i").style.width = (f.image_done ? 100 : Math.min(95, f.step / 7)) + "%";
+        c.querySelector(".l").textContent = `${f.strokes} 笔`;
+        c.querySelector(".r").textContent = f.image_done ? `完成 · ${f.elapsed.toFixed(1)} s` : `${f.elapsed.toFixed(1)} s`;
+        if (f.image_done) addHistory(f.image, b.prompt, f.strokes);
+      }
+    }
+  } catch (e) {
+    $("err").textContent = "出错了：" + e.message;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "开始作画";
+    refreshStat();
+  }
+};
+
+function addHistory(b64, prompt, strokes) {
+  const c = card(0);
+  c.querySelector("img").src = "data:image/png;base64," + b64;
+  c.querySelector(".bar").remove();
+  c.querySelector(".l").textContent = prompt.length > 16 ? prompt.slice(0, 16) + "…" : prompt;
+  const a = document.createElement("a");
+  a.href = "data:image/png;base64," + b64; a.download = "strata.png"; a.textContent = `${strokes} 笔 · 下载`;
+  c.querySelector(".r").appendChild(a);
+  $("history").prepend(c);
+}
+
+loadModels();
+</script>
+</body>
+</html>
