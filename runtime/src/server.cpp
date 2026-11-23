@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -88,8 +89,38 @@ double now_s() {
 struct Frame {                          // progress of one image
   int index = 0, step = 0, strokes = 0;
   bool done = false;
-  std::string png;
+  std::string png, id;                  // id: set on the final frame (continue from it with "from")
 };
+// a finished painting, kept so it can be continued (refine a layer / redraw a layer)
+struct Painting {
+  std::string model, prompt;
+  std::vector<Record> records;
+};
+const char* kLayerNames[] = {"background", "body", "skin", "features", "hair", "accessories"};
+
+// the edit prefixes the model was trained on (tools/continue_parity.py, lpp.sequence.build "refine" / "redraw"):
+// layers in order, each LAYER_j + its strokes in sequence order (redraw: without layer k), then REFINE_k / REDRAW_k
+std::vector<Record> edit_prefix(const Protocol& P, const std::vector<Record>& recs, const std::string& mode, int k) {
+  const int A = static_cast<int>(P.attrs.size());
+  std::vector<Record> out;
+  std::set<int> layers;
+  for (auto& r : recs) if (r.kind == P.kind_primitive) layers.insert(static_cast<int>(r.layer));
+  int used = 0;
+  for (int j : layers) {
+    if (mode == "redraw" && j == k) continue;
+    out.push_back({P.kind_control, P.event_id("LAYER_" + std::to_string(j)), j, std::vector<int64_t>(A, P.no_attr)});
+    for (auto& r : recs) if (r.kind == P.kind_primitive && r.layer == j) out.push_back(r);
+  }
+  for (auto& r : recs) used += r.kind == P.kind_primitive && r.layer == k;
+  if (mode == "refine") {
+    if (!layers.count(k)) throw std::runtime_error(std::string("this painting has no ") + kLayerNames[k] + " layer to refine");
+    if (used >= P.layer_cap.at(k)) throw std::runtime_error(std::string("the ") + kLayerNames[k] + " layer is full (" +
+                                                            std::to_string(used) + " strokes, the cap); redraw it instead");
+  }
+  out.push_back({P.kind_control, P.event_id((mode == "refine" ? "REFINE_" : "REDRAW_") + std::to_string(k)), k,
+                 std::vector<int64_t>(A, P.no_attr)});
+  return out;
+}
 struct Job {
   std::string model, prompt;
   int n = 1;
@@ -98,6 +129,10 @@ struct Job {
   int progress_every = 0;               // 0: no frames
   std::function<void(const Frame&)> on_frame;
   std::promise<std::vector<std::string>> result;   // final PNGs
+  std::vector<std::string> ids;                    // their painting ids (set before the result)
+  std::string edit_from, edit_mode;                // continue a painting: "refine" | "redraw" layer edit_layer
+  int edit_layer = -1;
+  std::vector<Record> forced;                      // built on the worker from edit_from
   double queued = now_s();
 };
 
@@ -128,6 +163,13 @@ class Server {
     cv_.notify_one();
     return f;
   }
+  bool recall(const std::string& id, Painting& out) {
+    std::lock_guard<std::mutex> lk(pmu_);
+    auto it = paintings_.find(id);
+    if (it == paintings_.end()) return false;
+    out = it->second;
+    return true;
+  }
   json stats() const {
     return {{"requests", requests_.load()}, {"images", images_.load()}, {"batches", batches_.load()},
             {"records", records_.load()}, {"busy_seconds", busy_.load()}};
@@ -153,7 +195,9 @@ class Server {
     int images = 0;
     for (auto it = queue_.begin(); it != queue_.end();) {
       auto& j = *it;
+      // continuations relax the grammar (REFINE / REDRAW allowed): never batched with fresh paintings
       if (j->model == first->model && j->cfg_scale == first->cfg_scale && j->top_p == first->top_p &&
+          j->edit_from.empty() == first->edit_from.empty() &&
           images + j->n <= std::max(max_batch_, first->n)) {
         images += j->n;
         batch.push_back(j);
@@ -181,6 +225,21 @@ class Server {
     const auto t0 = std::chrono::steady_clock::now();
     Painter& p = painter(batch[0]->model);
     const Protocol& P = p.protocol();
+    for (auto it = batch.begin(); it != batch.end();) {       // a bad edit fails its own request only
+      auto& j = *it;
+      try {
+        if (!j->edit_from.empty()) {
+          Painting src;
+          if (!recall(j->edit_from, src)) throw std::runtime_error("unknown painting id " + j->edit_from);
+          j->forced = edit_prefix(P, src.records, j->edit_mode, j->edit_layer);
+        }
+        ++it;
+      } catch (const std::exception& e) {
+        j->result.set_exception(std::make_exception_ptr(std::runtime_error(e.what())));
+        it = batch.erase(it);
+      }
+    }
+    if (batch.empty()) return;
     std::vector<std::string> prompts;
     std::vector<std::pair<Job*, int>> owner;              // image b -> (job, index within the job)
     for (auto& j : batch)
@@ -200,6 +259,10 @@ class Server {
     GenerateConfig cfg;
     cfg.sample.cfg_scale = batch[0]->cfg_scale;
     cfg.sample.top_p = batch[0]->top_p;
+    if (!batch[0]->edit_from.empty()) {
+      cfg.require_before_eos.clear();
+      for (int b = 0; b < B; ++b) cfg.forced.push_back(owner[b].first->forced);
+    }
     int every = 0;
     for (auto& j : batch) if (j->progress_every > 0) every = every ? std::min(every, j->progress_every) : j->progress_every;
     if (every > 0) {
@@ -223,9 +286,11 @@ class Server {
       recs += static_cast<long>(seqs[b].size());
       std::string img = render_png(P, seqs[b]);
       Job* j = owner[b].first;
+      const std::string id = remember({j->model, j->prompt, seqs[b]});
+      j->ids.push_back(id);
       if (j->on_frame && j->progress_every > 0) {
         Frame f;
-        f.index = owner[b].second, f.step = static_cast<int>(seqs[b].size()), f.done = true, f.png = img;
+        f.index = owner[b].second, f.step = static_cast<int>(seqs[b].size()), f.done = true, f.png = img, f.id = id;
         for (auto& r : seqs[b]) f.strokes += r.kind == P.kind_primitive;
         j->on_frame(f);
       }
@@ -239,6 +304,18 @@ class Server {
               << " s (" << static_cast<int>(recs / secs) << " records/s)\n";
   }
 
+  std::string remember(Painting p) {
+    std::lock_guard<std::mutex> lk(pmu_);
+    const std::string id = "p" + std::to_string(++next_painting_);
+    paintings_[id] = std::move(p);
+    porder_.push_back(id);
+    while (porder_.size() > 512) paintings_.erase(porder_.front()), porder_.pop_front();
+    return id;
+  }
+  std::mutex pmu_;
+  long next_painting_ = 0;
+  std::map<std::string, Painting> paintings_;
+  std::deque<std::string> porder_;
   std::map<std::string, std::string> dirs_;
   std::string provider_;
   int max_batch_;
@@ -290,11 +367,25 @@ void error(httplib::Response& res, int status, const std::string& msg, const std
   res.set_content(json{{"error", {{"message", msg}, {"type", type}}}}.dump(), "application/json");
 }
 
-std::shared_ptr<Job> job_from(const json& body, const Server& srv, std::string& err) {
+std::shared_ptr<Job> job_from(const json& body, Server& srv, std::string& err) {
   auto j = std::make_shared<Job>();
   j->model = body.value("model", srv.models().begin()->first);
-  if (!srv.has(j->model)) { err = "unknown model '" + j->model + "'"; return nullptr; }
   j->prompt = body.value("prompt", "");
+  if (body.contains("from")) {                      // continue a finished painting
+    Painting src;
+    j->edit_from = body["from"].get<std::string>();
+    if (!srv.recall(j->edit_from, src)) { err = "unknown painting id '" + j->edit_from + "' (ids live until the server restarts)"; return nullptr; }
+    j->model = src.model;                           // the prefix belongs to the model that painted it
+    if (j->prompt.empty()) j->prompt = src.prompt;  // a new prompt edits the layer (e.g. other hair colour)
+    j->edit_mode = body.value("edit", "redraw");
+    if (j->edit_mode != "refine" && j->edit_mode != "redraw") { err = "edit must be refine or redraw"; return nullptr; }
+    const json& L = body.contains("layer") ? body["layer"] : json("hair");
+    j->edit_layer = -1;
+    if (L.is_number_integer()) j->edit_layer = L.get<int>();
+    else for (int k = 0; k < 6; ++k) if (L.get<std::string>() == kLayerNames[k]) j->edit_layer = k;
+    if (j->edit_layer < 0 || j->edit_layer > 5) { err = "layer must be 0..5 or one of background, body, skin, features, hair, accessories"; return nullptr; }
+  }
+  if (!srv.has(j->model)) { err = "unknown model '" + j->model + "'"; return nullptr; }
   if (j->prompt.empty()) { err = "prompt is required"; return nullptr; }
   const json opt = body.contains("options") ? body["options"] : body;     // Ollama nests sampling options
   j->n = body.value("n", 1);
@@ -401,8 +492,10 @@ int serve(const std::map<std::string, std::string>& a, const std::map<std::strin
     auto finished_images = std::make_shared<std::atomic<int>>(0);
     j->progress_every = body.value("progress_every", 25);
     j->on_frame = [push, model, t0](const Frame& f) {
-      push(json{{"model", model}, {"index", f.index}, {"step", f.step}, {"strokes", f.strokes}, {"done", false},
-                {"image_done", f.done}, {"image", base64(f.png)}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+      json line{{"model", model}, {"index", f.index}, {"step", f.step}, {"strokes", f.strokes}, {"done", false},
+              {"image_done", f.done}, {"image", base64(f.png)}, {"elapsed", now_s() - t0}};
+    if (!f.id.empty()) line["id"] = f.id;
+    push(line.dump() + "\n", false);
     };
     auto fut = std::make_shared<std::future<std::vector<std::string>>>(srv.submit(j));
     std::thread([fut, push, model, t0, n] {

@@ -49,6 +49,11 @@
   pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px;
         overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
   .err { color: #d9480f; font-size: 13px; margin-top: 8px; }
+  .acts { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 10px; }
+  .acts button { background: var(--chip); color: var(--ink); border: 0; border-radius: 6px; padding: 4px 8px;
+                 font-size: 12px; cursor: pointer; }
+  .acts button:disabled { opacity: .5; cursor: default; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 </style>
 </head>
@@ -75,6 +80,8 @@
     <div class="range"><input id="topp" type="range" min="0.3" max="1" step="0.05" value="0.6"><span id="toppv">0.6</span></div>
     <button class="go" id="go">开始作画</button>
     <div class="err" id="err"></div>
+    <p class="hint">画完后，每张图下面可以「重画」某一层（用上面描述框里的新描述，比如把头发改成红色，其余部分不变），
+      或「细化」某一层（在原图上继续加笔）。每层有笔画上限，画满的层只能重画。</p>
     <h2>同样的请求，OpenAI 接口写法</h2>
     <pre id="curl"></pre>
   </section>
@@ -138,17 +145,18 @@ function card(i) {
   return c;
 }
 
-$("go").onclick = async () => {
-  const b = body();
-  if (!b.prompt) { $("err").textContent = "请先写描述"; return; }
+const EDITS = [["redraw", "hair", "重画头发"], ["redraw", "background", "重画背景"], ["redraw", "body", "重画衣服"],
+               ["refine", "features", "细化五官"], ["refine", "skin", "细化皮肤"]];
+
+// one streamed request: n cards in the stage, frames as they come, edit buttons on finished images
+async function paint(req, n, label) {
   $("err").textContent = ""; $("go").disabled = true; $("go").textContent = "作画中…";
+  document.querySelectorAll(".acts button").forEach((x) => (x.disabled = true));
   const stage = $("stage"); stage.innerHTML = "";
-  const cards = Array.from({ length: b.n }, (_, i) => stage.appendChild(card(i)));
-  const t0 = performance.now();
+  const cards = Array.from({ length: n }, (_, i) => stage.appendChild(card(i)));
   try {
     const res = await fetch("/api/generate", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: b.model, prompt: b.prompt, n: b.n, stream: true, progress_every: 10,
-                             options: { cfg_scale: b.cfg_scale, top_p: b.top_p, ...(b.seed !== undefined ? { seed: b.seed } : {}) } }) });
+                                              body: JSON.stringify({ ...req, stream: true, progress_every: 10 }) });
     if (!res.ok) throw new Error((await res.json()).error?.message || res.statusText);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -168,15 +176,44 @@ $("go").onclick = async () => {
         c.querySelector(".bar i").style.width = (f.image_done ? 100 : Math.min(95, f.step / 7)) + "%";
         c.querySelector(".l").textContent = `${f.strokes} 笔`;
         c.querySelector(".r").textContent = f.image_done ? `完成 · ${f.elapsed.toFixed(1)} s` : `${f.elapsed.toFixed(1)} s`;
-        if (f.image_done) addHistory(f.image, b.prompt, f.strokes);
+        if (f.image_done) {
+          addActions(c, f.id);
+          addHistory(f.image, label, f.strokes);
+        }
       }
     }
   } catch (e) {
     $("err").textContent = "出错了：" + e.message;
   } finally {
     $("go").disabled = false; $("go").textContent = "开始作画";
+    document.querySelectorAll(".acts button").forEach((x) => (x.disabled = false));
     refreshStat();
   }
+}
+
+function addActions(c, id) {
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  for (const [mode, layer, text] of EDITS) {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.title = mode === "redraw" ? "按描述框里的描述重画这一层，其他层不变" : "在这一层上继续加笔";
+    b.onclick = () => {
+      const p = body();
+      paint({ from: id, edit: mode, layer, prompt: p.prompt,
+              options: { cfg_scale: p.cfg_scale, top_p: p.top_p, ...(p.seed !== undefined ? { seed: p.seed } : {}) } },
+            1, `${text}：${p.prompt}`);
+    };
+    acts.appendChild(b);
+  }
+  c.appendChild(acts);
+}
+
+$("go").onclick = () => {
+  const b = body();
+  if (!b.prompt) { $("err").textContent = "请先写描述"; return; }
+  paint({ model: b.model, prompt: b.prompt, n: b.n,
+          options: { cfg_scale: b.cfg_scale, top_p: b.top_p, ...(b.seed !== undefined ? { seed: b.seed } : {}) } }, b.n, b.prompt);
 };
 
 function addHistory(b64, prompt, strokes) {
