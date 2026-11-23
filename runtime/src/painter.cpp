@@ -452,7 +452,9 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
       if (live[b]) out[b].push_back({kind[b], ev[b], layer[b], attrs[b]});
       done[b] = done[b] || ev[b] == eos;
     }
-    if (std::all_of(done.begin(), done.end(), [](bool d) { return d; })) break;
+    const bool all_done = std::all_of(done.begin(), done.end(), [](bool d) { return d; });
+    if (cfg.on_progress && (all_done || step % std::max(1, cfg.progress_every) == 0)) cfg.on_progress(step, out, done);
+    if (all_done) break;
 
     // canvas checkpoints (lpp.canvas.CanvasTracker.update)
     std::vector<int> hit;

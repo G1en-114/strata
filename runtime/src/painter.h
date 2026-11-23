@@ -21,6 +21,10 @@ struct GenerateConfig {
   SampleConfig sample;
   int max_records = 0;                 // 0: context minus text
   std::set<int> require_before_eos;    // e.g. {0, 2}: background and skin before EOS
+  // streaming (strata serve): called every progress_every decode steps and once at the end, with every sample's
+  // records so far and which samples have finished
+  std::function<void(int step, const std::vector<std::vector<Record>>& out, const std::vector<bool>& done)> on_progress;
+  int progress_every = 25;
 };
 
 // uniform(step, field, b): field 0 = event, 1 + i = attribute i
