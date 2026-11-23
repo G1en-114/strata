@@ -37,15 +37,9 @@ def sha256(p: Path) -> str:
 
 
 def samples(out: Path) -> None:
-    """Top rows (generated) of the final model's evaluation grids, anime then faces, 8 each."""
-    rows = []
-    for dom in ("anime", "face"):
-        g = Image.open(ROOT / f"out/v3_train/eval/B_ft_step012000_{dom}/grid_generated_over_real.png")
-        rows.append(g.crop((0, 0, 256 * 8, 256)))
-    sheet = Image.new("RGB", (256 * 8, 512))
-    for i, r in enumerate(rows):
-        sheet.paste(r, (0, 256 * i))
-    sheet.save(out / "samples.png", optimize=True)
+    """The README's portrait grid: 12 of 192 generated from validation captions (assets/img_v3_faces.json)."""
+    Image.open(ROOT / "assets/img_v3_faces.jpg").save(out / "samples.png", optimize=True)
+    shutil.copy2(ROOT / "assets/img_v3_faces.json", out / "samples.json")
 
 
 def main() -> None:

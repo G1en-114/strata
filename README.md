@@ -28,15 +28,15 @@
 </div>
 
 <p align="center">
-<img src="assets/img_v3_samples.jpg" alt="v3 模型根据中文描述生成的动漫与真人头像" width="100%">
-<br>
-<sub>v3 模型（129M）只看中文描述、一笔一笔画出的结果：上排动漫，下排真人照片风格（验证集描述，CFG 5，top-p 0.6，每条一张，未挑选）</sub>
-</p>
-
-<p align="center">
 <img src="assets/img_trace_frog_decompose.jpg" alt="分解器逐笔临摹一张训练范围之外的图片" width="100%">
 <br>
 <sub>分解器把一张训练范围外的 3D 卡通图拆成 2 个图层、864 笔广义高斯笔触（29.3 dB，8.1 s）：最左是原图，往右依次是笔触逐步叠加的过程</sub>
+</p>
+
+<p align="center">
+<img src="assets/img_v3_faces.jpg" alt="v3 模型根据中文描述一笔一笔画出的人像" width="100%">
+<br>
+<sub>v3 模型（129M）只根据中文描述、一笔一笔画出的人像：48 条验证集描述 × 每条 4 张，从 192 张里挑出 12 张（CFG 5，top-p 0.6；描述与种子见 <a href="assets/img_v3_faces.json">img_v3_faces.json</a>）</sub>
 </p>
 
 ---
@@ -187,7 +187,7 @@ GPU 要到 B=32 矩阵乘够大，Tensor Core 才起作用。
 | **照图画** | 上传任意图片，分解器拆成笔触逐笔画出（29–37.5 dB）；人像由自训的图层分割 U-Net（mIoU 0.76）分出语义图层，宽幅照片里的小人像会自动裁出；也可只拆草稿交给模型续画 |
 
 ```sh
-curl localhost:11435/v1/images/generations -d '{"prompt": "动漫，金发碧眼的少女，微笑", "seed": 1}'
+curl localhost:11435/v1/images/generations -d '{"prompt": "真人照片，黑色短发的年轻男性，微笑，背景模糊", "seed": 1}'
 ```
 
 ## 快速开始
