@@ -88,7 +88,9 @@
       <div><label><input type="radio" name="mode" value="trace" checked> 临摹（任何图片）</label></div>
       <div><label><input type="radio" name="mode" value="sketch"> 起稿＋模型续画</label></div>
     </div>
-    <p class="hint">临摹：把图拆成高斯笔画和线条再一笔笔画出来，什么图都行（约 10–15 秒）。
+    <p class="hint">人像和动漫头像会先用分层模型分出背景、身体、皮肤、五官、头发（上传后先显示分层预览），
+      画完可以「重画头发」换发色；其他图片按颜色分层，只能临摹，不能按层编辑。<br>
+      临摹：把图拆成高斯笔画和线条再一笔笔画出来，什么图都行（约 10–15 秒）。
       起稿＋续画：只拆出草稿，剩下的由模型按上面的描述画，只适合人像和动漫头像，其他图片会画乱。</p>
     <button class="go" id="up">上传并作画</button>
     <h2>同样的请求，OpenAI 接口写法</h2>
@@ -183,8 +185,9 @@ async function paint(req, n, label, send) {
         if (f.error) throw new Error(f.error);
         if (f.done) continue;
         if (f.status) {                       // picture tracing: before the first frame
+          if (f.layers_png) cards[0].querySelector("img").src = "data:image/png;base64," + f.layers_png;
           cards[0].querySelector(".l").textContent = f.status === "tracing" ? "正在拆解图片…" :
-            `拆成 ${f.strokes} 笔（${f.lines} 条线），相似度 ${f.psnr.toFixed(1)} dB`;
+            `${f.layering === "semantic" ? "语义分层" : "按颜色分层"} · ${f.strokes} 笔（${f.lines} 条线）· ${f.psnr.toFixed(1)} dB`;
           cards[0].querySelector(".r").textContent = `${f.elapsed.toFixed(1)} s`;
           continue;
         }
@@ -194,7 +197,7 @@ async function paint(req, n, label, send) {
         c.querySelector(".l").textContent = `${f.strokes} 笔`;
         c.querySelector(".r").textContent = f.image_done ? `完成 · ${f.elapsed.toFixed(1)} s` : `${f.elapsed.toFixed(1)} s`;
         if (f.image_done) {
-          addActions(c, f.id);
+          addActions(c, f.id, f.editable !== false);
           addHistory(f.image, label, f.strokes);
         }
       }
@@ -209,9 +212,14 @@ async function paint(req, n, label, send) {
   }
 }
 
-function addActions(c, id) {
+function addActions(c, id, editable) {
   const acts = document.createElement("div");
   acts.className = "acts";
+  if (!editable) {
+    acts.innerHTML = `<span class="hint">这张图不像人像/动漫头像，是按颜色分层的（层不是真正的头发、皮肤），不能按层编辑。</span>`;
+    c.appendChild(acts);
+    return;
+  }
   for (const [mode, layer, text] of EDITS) {
     const b = document.createElement("button");
     b.textContent = text;

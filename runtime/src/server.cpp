@@ -95,6 +95,7 @@ struct Frame {                          // progress of one image
 struct Painting {
   std::string model, prompt;
   std::vector<Record> records;
+  bool editable = true;                 // false: traced with colour layers (not semantic), redraw / refine refused
 };
 const char* kLayerNames[] = {"background", "body", "skin", "features", "hair", "accessories"};
 
@@ -447,6 +448,11 @@ std::shared_ptr<Job> job_from(const json& body, Server& srv, std::string& err) {
     j->edit_from = body["from"].get<std::string>();
     j->continuation = true;
     if (!srv.recall(j->edit_from, src)) { err = "unknown painting id '" + j->edit_from + "' (ids live until the server restarts)"; return nullptr; }
+    if (!src.editable) {
+      err = "this painting was traced with colour layers (the picture did not look like a portrait), so its layers are "
+            "not hair / skin / background and a layer edit would repaint the wrong part";
+      return nullptr;
+    }
     j->model = src.model;                           // the prefix belongs to the model that painted it
     if (j->prompt.empty()) j->prompt = src.prompt;  // a new prompt edits the layer (e.g. other hair colour)
     j->edit_mode = body.value("edit", "redraw");
@@ -601,8 +607,10 @@ int serve(const std::map<std::string, std::string>& a, const std::map<std::strin
     if (push) push(json{{"status", "tracing"}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
     json tr = call_trace(trace_port, image, mode == "sketch");
     auto recs = records_from(tr["records"]);
+    const bool semantic = tr.value("layering", "colour") == "semantic";
     if (push) push(json{{"status", "traced"}, {"psnr", tr["psnr"]}, {"strokes", tr["strokes"]}, {"lines", tr["lines"]},
-                        {"seconds", tr["seconds"]}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+                        {"seconds", tr["seconds"]}, {"layering", tr.value("layering", "colour")},
+                        {"layers_png", tr.value("layers_png", "")}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
     const std::string prompt = opts.value("prompt", "");
     if (mode == "trace") {
       const Protocol& P = srv.protocol(model);
@@ -616,12 +624,15 @@ int serve(const std::map<std::string, std::string>& a, const std::map<std::strin
                     {"image_done", false}, {"image", base64(render_png(P, cur))}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
       }
       std::string img = render_png(P, recs);
-      const std::string id = srv.remember({model, prompt, recs});
+      const std::string id = srv.remember({model, prompt, recs, semantic});
       if (push) push(json{{"model", model}, {"index", 0}, {"step", static_cast<int>(recs.size())}, {"strokes", strokes},
-                          {"done", false}, {"image_done", true}, {"image", base64(img)}, {"id", id}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
+                          {"done", false}, {"image_done", true}, {"image", base64(img)}, {"id", id}, {"editable", semantic},
+                          {"elapsed", now_s() - t0}}.dump() + "\n", false);
       return {img};
     }
     if (prompt.empty()) throw std::runtime_error("mode sketch needs a prompt (what the model should paint over the sketch)");
+    if (!semantic) throw std::runtime_error("sketch mode needs a portrait (face or anime): this picture was traced with "
+                                            "colour layers, and the model would paint hair over the wrong parts; use trace");
     json body = opts;
     body["model"] = model;
     std::string err;

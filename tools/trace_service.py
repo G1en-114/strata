@@ -2,7 +2,7 @@
 
     python tools/trace_service.py [--port 11436]
 
-POST /trace?sketch=0|1&steps=120   body: the image file (any format PIL reads)
+POST /trace?sketch=0|1&steps=120&layers=auto|semantic|colour   body: the image file (any format PIL reads)
   -> {"records": [[kind, event, layer, attrs...], ...] (BOS .. EOS, draft order; sketch=1: up to the first REFINE),
       "psnr", "strokes", "lines", "seconds"}
 GET  /health -> {"ok": true}
@@ -12,6 +12,7 @@ is PyTorch on the GPU; text-to-image in the C++ server does not need this proces
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import sys
@@ -20,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -56,11 +58,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with LOCK:
                 r = paint_image.trace(img, steps=int(q.get("steps", ["120"])[0]),
-                                      sketch_only=q.get("sketch", ["0"])[0] == "1")
+                                      sketch_only=q.get("sketch", ["0"])[0] == "1", layers=q.get("layers", ["auto"])[0])
         except Exception as e:                  # noqa: BLE001
             return self._send(500, {"error": f"tracing failed: {e}"})
+        pal = np.array([[235, 235, 235], [80, 120, 200], [230, 180, 150], [220, 60, 60], [120, 80, 40], [240, 220, 60]],
+                       np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(pal[r["labels"]]).save(buf, format="PNG")
         self._send(200, {"records": r["records"].tolist(), "psnr": r["psnr"], "strokes": r["strokes"],
-                         "lines": r["lines"], "seconds": r["seconds"]})
+                         "lines": r["lines"], "seconds": r["seconds"], "layering": r["layering"], "parser": r["parser"],
+                         "layers_png": base64.b64encode(buf.getvalue()).decode()})
 
     def log_message(self, fmt, *args) -> None:
         sys.stderr.write("trace: " + fmt % args + "\n")

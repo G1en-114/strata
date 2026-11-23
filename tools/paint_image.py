@@ -3,8 +3,10 @@
     python tools/paint_image.py photo.png --out out/trace/photo           # -> strokes.npy, trace.png, report
     python tools/paint_image.py photo.png --out ... --sketch-only         # only the sketch rounds (for continuation)
 
-Used by the strata server's image endpoint (tools/trace_service.py) and by hand. The face / anime datasets come with
-semantic layer labels; an arbitrary image does not, so the layers here are generic:
+Used by the strata server's image endpoint (tools/trace_service.py) and by hand. Layers:
+  semantic   (portraits, default when the picture looks like one) the layer parser (tools/train_layer_parser.py)
+             predicts the painter's 6 layers, so redraw / refine edits mean what the model learnt (hair is hair)
+  colour     (anything else, or no parser) generic layers:
   background   pixels connected to the image border with a colour close to the border's (flood fill in Oklab)
   foreground   k-means colours inside the rest, biggest cluster -> the layer with the most strokes (hair, 256), then
                skin (192), features (224), body (128); tracing only needs room for strokes, not semantics
@@ -36,6 +38,29 @@ from lpp.render.strokes import render_strokes  # noqa: E402
 from lpp.sequence import build  # noqa: E402
 
 FOREGROUND_LAYERS = [4, 2, 3, 1]          # by stroke cap: hair 256, skin 192, features 224, body 128
+PARSER = Path(__file__).resolve().parents[1] / "runs/layer_parser/layer_parser.pt"
+_parser = None
+
+
+def semantic_labels(img: np.ndarray, dev: str = "cuda") -> tuple[np.ndarray, bool, dict]:
+    """The layer parser's 6 layers, and whether the picture looks like a portrait (skin, features and hair present,
+    a confident prediction); stats for the decision."""
+    global _parser
+    if _parser is None:
+        from train_layer_parser import UNet
+        m = UNet().to(dev).eval()
+        m.load_state_dict(torch.load(PARSER, map_location=dev)["model"])
+        _parser = m
+    x = torch.from_numpy(img).to(dev).permute(2, 0, 1)[None].float() / 255
+    with torch.no_grad():
+        prob = torch.softmax(_parser(x).float(), 1)[0]
+    conf, lab = prob.max(0)
+    frac = torch.bincount(lab.flatten(), minlength=6).float() / lab.numel()
+    fg = lab > 0
+    stats = {"skin": round(float(frac[2]), 4), "features": round(float(frac[3]), 4), "hair": round(float(frac[4]), 4),
+             "confidence": round(float(conf[fg].mean()) if fg.any() else 0.0, 3)}
+    portrait = stats["skin"] > 0.02 and stats["features"] > 0.003 and stats["hair"] > 0.03 and stats["confidence"] > 0.75
+    return lab.cpu().numpy().astype(np.int64), portrait, stats
 
 
 def load_square(path_or_img, size: int = 256) -> np.ndarray:
@@ -84,11 +109,18 @@ def generic_labels(img: np.ndarray, k: int = 4, bg_tol: float = 0.06, seed: int 
 
 
 def trace(img: np.ndarray, steps: int = 120, line_steps: int = 200, sketch_only: bool = False, dev: str = "cuda",
-          seed: int = 0) -> dict:
-    """[256, 256, 3] uint8 -> {"records": [T, 3 + A] int64 (BOS .. EOS), "psnr", "strokes", "lines", "seconds"}."""
+          seed: int = 0, layers: str = "auto") -> dict:
+    """[256, 256, 3] uint8 -> {"records": [T, 3 + A] int64 (BOS .. EOS), "psnr", "strokes", "lines", "seconds",
+    "layering": "semantic" | "colour", "labels", "parser"}. layers: auto | semantic | colour."""
     import decompose_lines as dl
     t0 = time.time()
-    labels = generic_labels(img, seed=seed)
+    layering, stats = "colour", {}
+    if layers != "colour" and PARSER.exists():
+        sem, portrait, stats = semantic_labels(img, dev)
+        if layers == "semantic" or portrait:
+            labels, layering = sem, "semantic"
+    if layering == "colour":
+        labels = generic_labels(img, seed=seed)
     proto2 = load_protocol()
     codec2 = Codec.load(proto=proto2, device=dev)
     dec = LayeredDecomposer(codec2, DecomposeConfig(steps_per_round=steps, seed=seed))
@@ -109,7 +141,7 @@ def trace(img: np.ndarray, steps: int = 120, line_steps: int = 200, sketch_only:
         rec = rec[:cut]
     strokes = int((rec[:, 0] == 3).sum())
     return {"records": rec.astype(np.int64), "psnr": float(psnr), "strokes": strokes, "lines": int(K),
-            "seconds": time.time() - t0, "labels": labels}
+            "seconds": time.time() - t0, "labels": labels, "layering": layering, "parser": stats}
 
 
 def main() -> None:
@@ -119,10 +151,11 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=120, help="Gaussian fitting steps per round")
     ap.add_argument("--line-steps", type=int, default=200)
     ap.add_argument("--sketch-only", action="store_true")
+    ap.add_argument("--layers", choices=["auto", "semantic", "colour"], default="auto")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     img = load_square(args.image)
-    r = trace(img, args.steps, args.line_steps, args.sketch_only)
+    r = trace(img, args.steps, args.line_steps, args.sketch_only, layers=args.layers)
     np.save(args.out / "strokes.npy", r["records"][None])
     proto3 = load_protocol(PROTOCOL_V3_PATH)
     codec3 = Codec.load(proto=proto3, device="cuda")
