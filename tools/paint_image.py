@@ -80,6 +80,27 @@ def load_square(path_or_img, size: int = 256) -> np.ndarray:
     return np.asarray(sq.resize((size, size), Image.Resampling.LANCZOS))
 
 
+def portrait_crop(orig: Image.Image, lab: np.ndarray) -> Image.Image | None:
+    """The training framing (face centred, about half the frame, shoulders in) cut from the ORIGINAL picture, around
+    what the parser found as skin + features + hair on its 256 px square; None if it found no face."""
+    face = np.isin(lab, (2, 3, 4))
+    if face.sum() < 30 or not np.isin(lab, (2, 3)).any():
+        return None
+    ys, xs = np.nonzero(face)
+    w, h = orig.size
+    side = max(w, h)
+    k = side / lab.shape[0]                                      # square px -> original px
+    offx, offy = (side - w) / 2, (side - h) / 2
+    x0, x1 = xs.min() * k - offx, (xs.max() + 1) * k - offx
+    y0, y1 = ys.min() * k - offy, (ys.max() + 1) * k - offy
+    size = max(x1 - x0, y1 - y0) * 1.7                           # CelebA-like: the head is ~60% of the frame
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2 + 0.12 * size          # a little lower: shoulders in
+    box = (int(cx - size / 2), int(cy - size / 2), int(cx + size / 2), int(cy + size / 2))
+    if size < 48:
+        return None
+    return orig.convert("RGB").crop(box)                         # PIL pads outside the picture with black
+
+
 def generic_labels(img: np.ndarray, k: int = 4, bg_tol: float = 0.06, seed: int = 0) -> np.ndarray:
     """[S, S, 3] uint8 -> [S, S] layer ids (see the module docstring)."""
     from scipy import ndimage
@@ -109,14 +130,22 @@ def generic_labels(img: np.ndarray, k: int = 4, bg_tol: float = 0.06, seed: int 
 
 
 def trace(img: np.ndarray, steps: int = 120, line_steps: int = 200, sketch_only: bool = False, dev: str = "cuda",
-          seed: int = 0, layers: str = "auto") -> dict:
+          seed: int = 0, layers: str = "auto", orig: Image.Image | None = None) -> dict:
     """[256, 256, 3] uint8 -> {"records": [T, 3 + A] int64 (BOS .. EOS), "psnr", "strokes", "lines", "seconds",
     "layering": "semantic" | "colour", "labels", "parser"}. layers: auto | semantic | colour."""
     import decompose_lines as dl
     t0 = time.time()
-    layering, stats = "colour", {}
+    layering, stats, cropped = "colour", {}, False
     if layers != "colour" and PARSER.exists():
         sem, portrait, stats = semantic_labels(img, dev)
+        if not portrait and layers == "auto" and orig is not None:
+            # a person small in a wide photo: cut the portrait out of the original and look again
+            crop = portrait_crop(orig, sem)
+            if crop is not None:
+                img2 = load_square(crop)
+                sem2, portrait2, stats2 = semantic_labels(img2, dev)
+                if portrait2:
+                    img, sem, portrait, stats, cropped = img2, sem2, True, stats2, True
         if layers == "semantic" or portrait:
             labels, layering = sem, "semantic"
     if layering == "colour":
@@ -141,7 +170,8 @@ def trace(img: np.ndarray, steps: int = 120, line_steps: int = 200, sketch_only:
         rec = rec[:cut]
     strokes = int((rec[:, 0] == 3).sum())
     return {"records": rec.astype(np.int64), "psnr": float(psnr), "strokes": strokes, "lines": int(K),
-            "seconds": time.time() - t0, "labels": labels, "layering": layering, "parser": stats}
+            "seconds": time.time() - t0, "labels": labels, "layering": layering, "parser": stats, "cropped": cropped,
+            "image": img}
 
 
 def main() -> None:
@@ -154,8 +184,9 @@ def main() -> None:
     ap.add_argument("--layers", choices=["auto", "semantic", "colour"], default="auto")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    img = load_square(args.image)
-    r = trace(img, args.steps, args.line_steps, args.sketch_only, layers=args.layers)
+    orig = Image.open(args.image)
+    r = trace(load_square(orig), args.steps, args.line_steps, args.sketch_only, layers=args.layers, orig=orig)
+    img = r["image"]
     np.save(args.out / "strokes.npy", r["records"][None])
     proto3 = load_protocol(PROTOCOL_V3_PATH)
     codec3 = Codec.load(proto=proto3, device="cuda")
@@ -166,7 +197,7 @@ def main() -> None:
     Image.fromarray(img).save(args.out / "input.png")
     pal = np.array([[230, 230, 230], [80, 120, 200], [230, 180, 150], [220, 60, 60], [120, 80, 40], [240, 220, 60]], np.uint8)
     Image.fromarray(pal[r["labels"]]).save(args.out / "layers.png")
-    rep = {k: v for k, v in r.items() if k not in ("records", "labels")}
+    rep = {k: v for k, v in r.items() if k not in ("records", "labels", "image")}
     (args.out / "report.json").write_text(json.dumps(rep, indent=1))
     print(json.dumps(rep))
 

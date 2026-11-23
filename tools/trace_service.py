@@ -52,13 +52,16 @@ class Handler(BaseHTTPRequestHandler):
         if n <= 0 or n > 32 << 20:
             return self._send(400, {"error": "send the image as the request body (at most 32 MB)"})
         try:
-            img = paint_image.load_square(Image.open(io.BytesIO(self.rfile.read(n))))
+            orig = Image.open(io.BytesIO(self.rfile.read(n)))
+            orig.load()
+            img = paint_image.load_square(orig)
         except Exception as e:                  # noqa: BLE001 - any undecodable upload
             return self._send(400, {"error": f"cannot read the image: {e}"})
         try:
             with LOCK:
                 r = paint_image.trace(img, steps=int(q.get("steps", ["120"])[0]),
-                                      sketch_only=q.get("sketch", ["0"])[0] == "1", layers=q.get("layers", ["auto"])[0])
+                                      sketch_only=q.get("sketch", ["0"])[0] == "1", layers=q.get("layers", ["auto"])[0],
+                                      orig=orig)
         except Exception as e:                  # noqa: BLE001
             return self._send(500, {"error": f"tracing failed: {e}"})
         pal = np.array([[235, 235, 235], [80, 120, 200], [230, 180, 150], [220, 60, 60], [120, 80, 40], [240, 220, 60]],
@@ -67,6 +70,7 @@ class Handler(BaseHTTPRequestHandler):
         Image.fromarray(pal[r["labels"]]).save(buf, format="PNG")
         self._send(200, {"records": r["records"].tolist(), "psnr": r["psnr"], "strokes": r["strokes"],
                          "lines": r["lines"], "seconds": r["seconds"], "layering": r["layering"], "parser": r["parser"],
+                         "cropped": r["cropped"],
                          "layers_png": base64.b64encode(buf.getvalue()).decode()})
 
     def log_message(self, fmt, *args) -> None:

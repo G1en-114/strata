@@ -187,7 +187,7 @@ async function paint(req, n, label, send) {
         if (f.status) {                       // picture tracing: before the first frame
           if (f.layers_png) cards[0].querySelector("img").src = "data:image/png;base64," + f.layers_png;
           cards[0].querySelector(".l").textContent = f.status === "tracing" ? "正在拆解图片…" :
-            `${f.layering === "semantic" ? "语义分层" : "按颜色分层"} · ${f.strokes} 笔（${f.lines} 条线）· ${f.psnr.toFixed(1)} dB`;
+            `${f.cropped ? "已自动裁到人像 · " : ""}${f.layering === "semantic" ? "语义分层" : "按颜色分层"} · ${f.strokes} 笔（${f.lines} 条线）· ${f.psnr.toFixed(1)} dB`;
           cards[0].querySelector(".r").textContent = `${f.elapsed.toFixed(1)} s`;
           continue;
         }

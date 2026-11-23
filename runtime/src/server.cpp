@@ -609,7 +609,7 @@ int serve(const std::map<std::string, std::string>& a, const std::map<std::strin
     auto recs = records_from(tr["records"]);
     const bool semantic = tr.value("layering", "colour") == "semantic";
     if (push) push(json{{"status", "traced"}, {"psnr", tr["psnr"]}, {"strokes", tr["strokes"]}, {"lines", tr["lines"]},
-                        {"seconds", tr["seconds"]}, {"layering", tr.value("layering", "colour")},
+                        {"seconds", tr["seconds"]}, {"layering", tr.value("layering", "colour")}, {"cropped", tr.value("cropped", false)},
                         {"layers_png", tr.value("layers_png", "")}, {"done", false}, {"elapsed", now_s() - t0}}.dump() + "\n", false);
     const std::string prompt = opts.value("prompt", "");
     if (mode == "trace") {
