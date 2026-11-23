@@ -1,7 +1,7 @@
 # Strata：会一笔一笔作画的生成模型，以及它的部署、量化与算子工具链
 
-模型不直接输出像素，而是按语义图层的顺序，一笔一笔输出**广义高斯笔触**（位置、大小、角度、边缘硬度、颜色、透明度）；
-笔触叠起来就是画。整条链路都是从零自己做的：数据生产 → 训练与强化学习 → 评估 → ONNX 导出 → C++ 推理运行时 → 量化 → GPU 算子。
+模型不直接输出像素，而是按语义图层的顺序，一笔一笔输出**广义高斯笔触**（位置、大小、角度、边缘硬度、颜色、透明度）
+和**贝塞尔线条**（v3 起，用于发丝、轮廓）；笔触叠起来就是画。整条链路都是从零自己做的：数据生产 → 训练与强化学习 → 评估 → ONNX 导出 → C++ 推理运行时 → 量化 → GPU 算子。
 这个项目的重点是**部署与高性能计算**：每个优化都先剖析瓶颈，再改，再证明结果没变，最后测速。
 
 ## 一眼看懂
@@ -11,6 +11,8 @@
 | 模型 | 两级 Transformer（主干 + 属性解码器）+ 画布反馈，base 129M / small 20M | 语义分层协议，可局部重画、续画 |
 | 导出 | 6 个 ONNX 图 + 定形单步图，融合 RoPE 与注意力 | 与 PyTorch 最大误差 ≤ 1.2e-5；ORT 与 PyTorch 采样 **1600/1600 个记录完全一致** |
 | C++ 运行时 | ONNX Runtime + CUDA Graph + 原地更新的 KV cache + 按图放置到 CPU / GPU | small 模型 B=8：**735 → 1010 records/s（+37%）**，生成结果逐条相同 |
+| GPU 瓶颈优化（base 模型） | 剖析发现每个记录要串行调用约 10 次输出头；把 9 个属性的采样（引导、top-p、固定槽）融合进一张图 | 与参考采样器逐 token 一致；GPU 上 +17–30%，再加 FP16：B=32 时 **340 → 586 records/s（1.7×）** |
+| 本地服务 | C++ 推理服务 `strata`：OpenAI 兼容接口、流式逐笔输出、请求合批、续画、照图画 | `./serve.sh` 一键启动，浏览器打开就能用 |
 | 量化（base 模型） | FP16 / 动态 INT8 / 仅权重 INT8 / 仅权重 INT4，两层验收 | **GPU 选 FP16**：B=32 时 529 records/s（+40%），top-1 一致率 98.6%；**CPU 选动态 INT8**：B=1 时 64 vs 29 records/s（+121%） |
 | GPU 算子 | 自写 Triton tile 光栅化器（前向 + 反向） | 比 PyTorch 稠密实现快 **64×**（RTX 5070） |
 | 跨平台 | 同一份 CUDA 源码经 hipify 移植到海光 DCU | 见 `docs/hip_port_log.md` |
@@ -62,6 +64,20 @@
 - **验收分两层**：先看单步数值保真度（KL、top-1、主干相对误差），再看生成分布（CLIP 分数）。量化后序列会早早分叉，逐 token 对比没有意义，所以只比较单步输出和整体分布。
 - 完整数据和踩过的坑见 [`docs/deploy_report_v3.md`](docs/deploy_report_v3.md)、[`docs/quant_report.md`](docs/quant_report.md)。
 
+## 本地服务：strata（类似 Ollama）
+
+```bash
+./serve.sh            # 首次会自动编译、导出模型；之后几秒启动，并打开 http://localhost:11435
+./serve.sh status     # 状态；./serve.sh logs 看日志；./serve.sh stop 停止
+```
+
+- **纯 C++，不依赖 Python**：中文描述 → C++ WordPiece 分词（和 HuggingFace 在 16.6 万条描述上逐 id 一致）→ ONNX 文本编码器 → 作画模型 → C++ 渲染 PNG。
+- **接口**：OpenAI 兼容的 `POST /v1/images/generations`、`POST /v1/images/edits`、`GET /v1/models`，可以直接作为 Open WebUI 等前端的图片后端；Ollama 风格的 `POST /api/generate` 流式返回作画过程中的每一帧。
+- **请求合批**：一个工作线程独占 GPU，同时到达、参数相同的请求合成一个 batch 一起解码。
+- **续画**：画完的图可以只重画某一层（换描述，比如把头发改成红色，脸不变），或在某一层上继续加笔；C++ 续画与 PyTorch 逐 token 一致（`tools/continue_parity.py`）。
+- **照图画**：上传任意图片，分解器（`tools/paint_image.py`，通用分层）把它拆成高斯笔触和线条再逐笔画出（测试图 29–37.5 dB）；或只拆草稿、交给模型续画（适合人像和动漫头像）。
+- 网页前端在 `runtime/web/`，服务源码在 `runtime/src/server.cpp`。
+
 ## GPU 算子：Triton 光栅化器
 
 分解器每一步都要把一层图元渲染成图并反向求梯度，是整个流水线的瓶颈。基线是稠密实现（每个图元对每个像素都算）；
@@ -79,7 +95,7 @@ tile 版先按 16×16 分箱，只算与包围盒相交的“像素 × 图元”
 | 路径 | 内容 |
 |---|---|
 | `python/lpp/` | 协议、分解器、模型、训练、RL、导出 |
-| `runtime/` | C++ 推理运行时（ORT、CUDA Graph、语法、采样）；入口 `runtime/run.sh` |
+| `runtime/` | C++ 推理运行时（ORT、CUDA Graph、语法、采样）与本地服务 `strata`、网页前端；入口 `runtime/run.sh`、`./serve.sh` |
 | `tools/` | 导出 `export_onnx.py`、量化 `quantize_onnx.py`、评估 `quant_eval.py`、`ort_generate.py` 等 |
 | `bench/` | 光栅化与运行时的基准脚本和报告 |
 | `ops/` | 多机训练与部署流程脚本 |
